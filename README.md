@@ -150,24 +150,25 @@ Use `--expand` to enumerate every account.
 
 ## Password Intelligence
 
-Password statistics are shown automatically whenever `--potfile` is supplied. There is no separate enable flag because no plaintext statistics can be calculated without recovered plaintexts. To load a potfile while suppressing the statistics section, use:
+Password statistics are shown automatically whenever `--potfile` is supplied. There is no separate enable flag because plaintext statistics cannot be calculated without recovered plaintexts. To load a potfile while suppressing the statistics section, use:
 
 ```bash
 python3 credweave.py ntdsdump.txt \
   --potfile client.pot \
-  --no-password-stats             Suppress cracked-password statistics normally shown with --potfile
+  --no-password-stats
+```
 
-This does not disable potfile-backed functionality such as cracked-credential correlation, Tier 0 recovery analysis, or adaptive cracking workflows.
+This does not disable other potfile-backed functionality such as cracked-credential correlation, Tier 0 analysis, or adaptive cracking features.
 
 ### Password Length (account-weighted)
 
-**Account-weighted** means each account using a recovered password contributes one observation to the password-length statistics. A password reused by 20 accounts therefore contributes 20 observations, while a password used by one account contributes one.
+**Account-weighted** means each account using a recovered password contributes one observation.
 
-This intentionally measures the password-length exposure of the **account population**, not merely the characteristics of the unique cracked-password corpus. For example, if one 8-character password is shared by 50 accounts and one 16-character password is used by a single account, the account-weighted view reflects that most affected accounts are protected by the 8-character password.
+For example, if the plaintext `ExamplePassword1!` is shared by 20 accounts, its length contributes 20 observations to the password-length distribution. This intentionally measures password-length exposure across the **account population**, rather than only the distribution of unique recovered passwords.
 
-This is distinct from a unique-password-weighted calculation, where each distinct plaintext would count exactly once regardless of reuse. For pentest reporting, the account-weighted view is generally more representative of how password characteristics affect the recovered account population.
+A unique-password-weighted calculation would instead count that plaintext once regardless of how many accounts use it.
 
-When a hashcat potfile is supplied, CredWeave analyzes the cracked corpus in the context of the accounts that own those credentials.
+When a hashcat potfile is supplied, CredWeave analyzes the cracked corpus in the context of the supplied account data:
 
 ```bash
 python3 credweave.py ntdsdump.txt \
@@ -175,38 +176,7 @@ python3 credweave.py ntdsdump.txt \
   --potfile ~/.local/share/hashcat/hashcat.potfile
 ```
 
-The `Cracked Password Intelligence` section includes:
-
-- user-account and unique-hash crack rates
-- enabled-account crack rate
-- privileged and Tier 0 crack rates
-- account-weighted password-length distribution
-- common password structural families
-- character-set distributions
-- observed Hashcat masks
-- obvious username-derived passwords
-
-Example:
-
-```text
-=== Cracked Password Intelligence ===
-[i] User accounts          716 / 1785  (40.1%)
-[i] Enabled accounts       370 / 941   (39.3%)
-[i] Privileged accounts      6 / 25    (24.0%)
-[i] Tier 0 accounts          6 / 25    (24.0%)
-[i] Unique NT hashes       375 / 1300  (28.8%)
-
-Password Length (account-weighted)
-  10:241  12:189  13:86  9:65  14:48
-
-Common Families
-  mixed                    325
-  word+special+digits      148
-  word+digits+special      122
-  word+digits              119
-```
-
-The known empty-password NT hash is excluded from cracked-password statistics, masks, adaptive cracking material, and the ordinary `Cracked Credentials` table. Empty-password accounts remain visible in their dedicated analysis section.
+Plaintexts remain masked in normal terminal output. Use `--show-plaintext` only when explicit plaintext display is desired.
 
 ## Priority Cracking Opportunities
 
