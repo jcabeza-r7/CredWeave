@@ -17,6 +17,36 @@ The goal is not merely to answer *which hashes repeat?* CredWeave tries to answe
 
 CredWeave masks hashes by default and separates high-signal relationships from bulk reuse so terminal output remains screenshot-friendly.
 
+## Demo
+
+The repository includes a fully synthetic demo corpus so CredWeave can be exercised without using engagement data.
+
+<p align="center">
+  <img src="docs/media/credweave-demo.gif" alt="CredWeave synthetic terminal demonstration">
+</p>
+
+```bash
+python3 credweave.py examples/sample-ntdsdump.txt \
+  --bloodhound examples/sample-bloodhound.zip \
+  --potfile examples/sample.pot \
+  --cracked-t0 \
+  --uncracked-t0 \
+  --width 130
+```
+
+The demo intentionally exercises privilege-boundary reuse, standard/admin identity reuse, enabled/disabled reuse, Tier 0 recovery state, password intelligence, and cracking prioritization. Every account, hash, plaintext, SID, and BloodHound object in `examples/` is synthetic.
+
+Static captures are also available for closer inspection:
+
+<p align="center">
+  <img src="docs/media/credweave-overview.png" alt="CredWeave credential reuse overview" width="95%">
+</p>
+
+<p align="center">
+  <img src="docs/media/credweave-password-intelligence.png" alt="CredWeave password intelligence" width="95%">
+</p>
+
+
 ## Requirements
 
 - Python 3
@@ -763,7 +793,7 @@ usage: credweave [-h] [enrichment] [credential intelligence] [analysis] [output]
 --crack-out FILE                Write unique uncracked NT hashes
 --lm-crack-out FILE             Write unique LM hashes
 -l, --lm                        Report accounts storing LM hashes
---no-password-stats                Show cracked-password intelligence
+--no-password-stats             Suppress cracked-password intelligence
 --generate-candidates FILE      Write target-derived source/base words
 --generate-rules FILE           Write target-derived Hashcat rules
 --generate-masks FILE           Write observed Hashcat masks
@@ -771,6 +801,10 @@ usage: credweave [-h] [enrichment] [credential intelligence] [analysis] [output]
 --attack-dir DIR                Write adaptive cracking workspace and runner
 --hashcat-bin PATH              Hashcat executable for generated runner
 --combinator-bin PATH           hashcat-utils combinator executable for generated runner
+--cracked-t0                    Show cracked Tier 0 accounts
+--uncracked-t0                  Show uncracked Tier 0 accounts
+--show-plaintext                Show recovered plaintexts (masked by default)
+--crack-out-t0 FILE             Write unique uncracked Tier 0 NT hashes
 ```
 
 ### Analysis

@@ -1,0 +1,81 @@
+[i] BloodHound sample-bloodhound.zip: 15 user record(s), 3 group record(s), 4 resolved membership(s), 15 status observation(s) | JSON schema v6
+[i] 15 user account(s), 10 unique NT hash(es), 4 reused credential(s) across 9 account(s), 0 empty-password account(s) | 13 enabled, 2 disabled, 0 unknown status | 0 machine account(s) retained but excluded from human reuse stats
+[i] Reuse groups: 4 actionable (enabled/unknown present), 0 disabled-only
+Legend: [T0] Tier 0  [P] Privileged  [A] Admin-like name  [D] Disabled  [!] Conflicting status
+
+=== Privilege Boundary Credential Reuse ===
+[!] Credential shared across a privilege boundary
+    Privileged: admeggsample [Tier 0]
+    Other: eggsample
+    Relationship: same NT credential; 1 enabled non-privileged account(s)
+
+=== Likely Standard / Privileged Identity Reuse ===
+[!] admeggsample [Tier 0] <-> eggsample
+
+=== Enabled / Disabled Credential Reuse ===
+[!] Mixed account-state credential reuse
+    Enabled: jdoe, tnguyen
+    Disabled: legacy.jdoe [Disabled]
+
+=== Actionable Credential Reuse ===
+Hash                                      Accounts Sharing  Users
+----------------------------------------------------------------------------------------------------------------------------------
+980dfdd7****************73a081fe          3                 jdoe, legacy.jdoe [D], tnguyen
+70ab51ed****************ee5d9dac          2                 admeggsample [T0], eggsample
+da7a868a****************8fdab1f6          2                 svc_backup, svc_sql
+e9bc95d8****************22cc1801          2                 svc_web, webdeploy
+
+=== Cracked Tier 0 Accounts ===
+[i] 2 Tier 0 account(s) cracked: 2 enabled, 0 disabled, 0 unknown/conflict
+Account        Status     Privilege   Password
+----------------------------------------------------------------------------------------------------------------------------------
+admeggsample   Enabled    Tier 0      ********
+helpdesk.test  Enabled    Tier 0      ********
+
+=== Uncracked Tier 0 Accounts ===
+[i] 1 Tier 0 account(s) remain uncracked: 0 enabled, 1 disabled, 0 unknown/conflict
+Account    Status     Privilege
+----------------------------------------------------------------------------------------------------------------------------------
+admlegacy  Disabled   Tier 0    
+
+=== Cracked Password Intelligence ===
+[i] User accounts           12 / 15    (80.0%)
+[i] Enabled accounts        11 / 13    (84.6%)
+[i] Privileged accounts      2 / 3     (66.7%)
+[i] Tier 0 accounts          2 / 3     (66.7%)
+[i] Unique NT hashes         7 / 10    (70.0%)
+
+Password Length (account-weighted)
+  11:8  12:3  13:1
+
+Common Families
+  word+digits+special      11
+  mixed                    1
+
+Character Sets
+  lower+upper+digit+special 12
+
+Top Hashcat Masks
+  ?u?l?l?l?l?l?d?d?d?d?s                   8
+  ?u?l?l?l?l?l?l?d?d?d?d?s                 2
+  ?u?l?l?l?d?l?l?d?d?d?d?s                 1
+  ?u?l?l?l?l?l?l?l?d?d?d?d?s               1
+
+=== Priority Cracking Opportunities ===
+Score  Hash                                      Accounts  Why
+----------------------------------------------------------------------------------------------------
+  100  04976435****************5eda8b60                 1  Tier 0
+    3  1e8630b8****************20ec8b96                 1  1 enabled
+    3  e82a5c70****************583ce551                 1  1 enabled
+
+=== Cracked Credentials ===
+[i] 7 unique NT hash(es) present in potfile
+Password  Accounts  Users
+----------------------------------------------------------------------------------------------------------------------------------
+********         3  jdoe, legacy.jdoe [D], tnguyen
+********         2  admeggsample [T0], eggsample
+********         2  svc_backup, svc_sql
+********         2  svc_web, webdeploy
+********         1  mrivera
+********         1  asmith
+********         1  helpdesk.test [T0]
