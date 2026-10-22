@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 RED = "\033[31m"
 GREEN = "\033[32m"
@@ -611,6 +611,28 @@ def import_enum4linux(path: str, registry: Registry) -> dict[str, int]:
     return {"users": len(users_seen), "memberships": memberships}
 
 
+HEX_PLAINTEXT_RE = re.compile(r"^\$HEX\[([0-9a-fA-F]*)\]$")
+
+
+def decode_hashcat_plaintext(value: str) -> str:
+    """Decode hashcat's $HEX[...] plaintext representation when valid UTF-8.
+
+    Preserve malformed or non-UTF-8 values verbatim rather than corrupting
+    password bytes. A literal password matching $HEX[...] is ambiguous in
+    hashcat output and is interpreted as encoded data.
+    """
+    match = HEX_PLAINTEXT_RE.fullmatch(value)
+    if not match:
+        return value
+    hex_value = match.group(1)
+    if len(hex_value) % 2:
+        return value
+    try:
+        return bytes.fromhex(hex_value).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return value
+
+
 def load_potfile(path: str) -> dict[str, str]:
     plains = {}
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -620,7 +642,7 @@ def load_potfile(path: str) -> dict[str, str]:
             if sep and valid_hash(h):
                 if plain == "" and h != NT_EMPTY_HASH:
                     continue
-                plains[h] = plain
+                plains[h] = decode_hashcat_plaintext(plain)
     return plains
 
 

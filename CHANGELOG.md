@@ -1,3 +1,8 @@
+## 1.6.2
+- Decode valid UTF-8 hashcat `$HEX[...]` potfile plaintexts before downstream analysis and rule generation.
+- Preserve malformed or non-UTF-8 encodings unchanged.
+- Add regression tests for HEX handling, including embedded colons.
+
 # Changelog
 
 ## 1.6.1 - 2026-10-01

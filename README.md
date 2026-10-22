@@ -180,6 +180,8 @@ Use `--expand` to enumerate every account.
 
 ## Password Intelligence
 
+Hashcat `$HEX[...]` plaintext values in potfiles are automatically decoded as UTF-8 before password statistics, candidate generation, and rule generation. For example, `$HEX[436f6c6f73656e73657340323a3134]` becomes `Colosenses@2:14`. Malformed or non-UTF-8 sequences are preserved unchanged.
+
 Password statistics are shown automatically whenever `--potfile` is supplied. There is no separate enable flag because plaintext statistics cannot be calculated without recovered plaintexts. To load a potfile while suppressing the statistics section, use:
 
 ```bash

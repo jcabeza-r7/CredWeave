@@ -13,7 +13,7 @@ spec.loader.exec_module(cw)
 
 class CredWeaveSmokeTests(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(cw.VERSION, "1.6.1")
+        self.assertEqual(cw.VERSION, "1.6.2")
 
     def test_help(self):
         p = subprocess.run([sys.executable, str(SCRIPT), "--help"],
@@ -36,6 +36,22 @@ class CredWeaveSmokeTests(unittest.TestCase):
         self.assertTrue(rules)
         self.assertTrue(masks)
         self.assertTrue(all(w == w.lower() for w in words))
+
+    def test_hashcat_hex_plaintexts(self):
+        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[436f6c6f73656e73657340323a3134]"), "Colosenses@2:14")
+        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[706173733a776f7264]"), "pass:word")
+        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[70617373]"), "pass")
+        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[zz]"), "$HEX[zz]")
+        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[abc]"), "$HEX[abc]")
+        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[ff]"), "$HEX[ff]")
+        self.assertEqual(cw.decode_hashcat_plaintext("ordinary!"), "ordinary!")
+
+    def test_potfile_hex_ingestion(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pot = pathlib.Path(d) / "sample.pot"
+            pot.write_text("a" * 32 + ":$HEX[706173733a776f7264]\n")
+            self.assertEqual(cw.load_potfile(str(pot))["a" * 32], "pass:word")
 
     def test_bloodhound_status_variants(self):
         self.assertTrue(cw.bloodhound_enabled({"enabled": True}))
