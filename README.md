@@ -109,7 +109,7 @@ python3 credweave.py ntdsdump.txt \
   --bloodhound bloodhound.zip
 ```
 
-CredWeave accepts a BloodHound collector ZIP, directory, or JSON and uses group membership and user metadata to enrich privilege and account-state analysis.
+CredWeave accepts a BloodHound collector ZIP, directory, or JSON and uses group membership and user metadata to enrich privilege and account-state analysis. Collector group records include nested group members; CredWeave resolves their effective user memberships by SID, preserving domain-qualified group identities and cycle-safe shortest evidence paths. Locally inferred Tier 0 membership uses the supported group names in `TIER0_GROUPS` and is **not identical** to BloodHound CE's configured Tier Zero privilege zone.
 
 This enables higher-signal relationships such as:
 
@@ -180,7 +180,7 @@ Use `--expand` to enumerate every account.
 
 ## Password Intelligence
 
-Hashcat `$HEX[...]` plaintext values in potfiles are automatically decoded as UTF-8 before password statistics, candidate generation, and rule generation. For example, `$HEX[436f6c6f73656e73657340323a3134]` becomes `Colosenses@2:14`. Malformed or non-UTF-8 sequences are preserved unchanged.
+Hashcat `$HEX[...]` plaintext values in potfiles are automatically decoded as UTF-8 before password statistics, candidate generation, and rule generation. For example, `$HEX[64656d6f3a74776f]` becomes `demo:two`. Malformed or non-UTF-8 sequences are preserved unchanged.
 
 Password statistics are shown automatically whenever `--potfile` is supplied. There is no separate enable flag because plaintext statistics cannot be calculated without recovered plaintexts. To load a potfile while suppressing the statistics section, use:
 
@@ -892,3 +892,110 @@ python3 credweave.py --version
 
 **CredWeave**  
 *Find the relationships hiding in credential material.*
+
+### Administrative privilege exposure (BloodHound graph export)
+
+CredWeave can review **direct and inherited user-to-computer `AdminTo`** relationships from
+BloodHound graph JSON exports (`nodes` and `edges`). It follows explicit nested
+`MemberOf` group paths, but does not establish whether access is unnecessary.
+The output is a list of **review candidates**, not confirmed vulnerabilities.
+
+Graph-only (no credential dump required):
+
+```bash
+python3 credweave.py --privilege-exposure --bloodhound graph.json \
+  --min-admin-count 10 --privilege-csv privilege_exposure.csv
+```
+
+Correlate a credential dump with direct administrative exposure:
+
+```bash
+python3 credweave.py ntds.txt --bloodhound graph.json --privilege-exposure \
+  --privilege-csv privilege_exposure.csv \
+  --credential-exposure-csv credential_exposure.csv
+```
+
+You can repeat `--bloodhound` to combine graph exports and legacy collector
+ZIPs. The latter remain supported for their existing user/group enrichment,
+but a collector ZIP alone does not provide the graph edges needed for this
+feature. Credential correlation requires an unambiguous SID or matching
+SAM-account-name **and** domain; name-only matching is intentionally avoided.
+Accounts lacking a trustworthy match remain in the privilege-only CSV.
+
+Output notes:
+
+- `AdminTo Systems` counts distinct computer targets (not graph edge count).
+- `CROSS_DOMAIN` denotes different AD domains, **not necessarily forests**.
+- `T0_ACCOUNT` reports locally derived account Tier 0 group membership;
+  `T0_ADMIN_ACCESS` uses the exported graph's Tier Zero target indicator.
+  Neither implies an authoritative BloodHound CE privilege-zone export.
+- `TEST_NAMING` and `SERVICE_NAMING` are heuristic name-based review flags.
+- Credential reuse exposure counts unique targets separately from summed
+  account-to-target relationships; hash values are masked unless `--show-hashes`
+  is explicitly specified.
+- A missing relationship may indicate incomplete BloodHound collection.
+
+### Multiple domains and credential dumps
+
+Supply multiple explicitly labeled NTDS dumps using repeatable `--ntds DOMAIN=PATH` arguments. This prevents accounts with the same `sAMAccountName` in different domains from being silently combined. The original positional dump remains supported. Multiple `--potfile FILE` arguments are supported; conflicting plaintext values for a hash cause an error.
+
+```bash
+./credweave.py \
+  --ntds OTHER.EXAMPLE=other_ntds.txt \
+  --ntds CORP.EXAMPLE=corp_ntds.txt \
+  --bloodhound other_bloodhound.zip \
+  --bloodhound corp_bloodhound.zip \
+  --bloodhound privilege_graph.json \
+  --potfile other.pot --potfile corp.pot \
+  --privilege-exposure \
+  --privilege-csv privilege_exposure.csv \
+  --credential-exposure-csv credential_exposure.csv
+```
+
+For an unlabeled legacy positional dump, BloodHound account enrichment is reconciled only when exactly one domain-qualified account matches the username. If multiple domains contain that username, CredWeave leaves the credential unqualified and warns rather than guessing. For reliable multidomain reports, label **every** dump.
+
+#### Domain aliases for mixed-prefix secretsdump output
+
+When one AD domain appears under multiple embedded prefixes in a dump, explicitly
+map each known alternate prefix to its canonical BloodHound domain name:
+
+```bash
+./credweave.py \
+  --ntds CORP.EXAMPLE=corp-ntds-dump.ntds \
+  --domain-alias ALIAS.EXAMPLE=CORP.EXAMPLE \
+  --ntds OTHER.EXAMPLE=other-ntds.txt \
+  --bloodhound corp_bloodhound.zip \
+  --bloodhound other_bloodhound.zip \
+  --privilege-exposure
+```
+
+`--domain-alias` is repeatable and case-insensitive. Only configure aliases
+whose equivalence you have independently confirmed. Unrecognized embedded
+prefixes still fail validation. Aliases affect NTDS ingestion, not automatic
+rewriting of BloodHound domain identifiers. Accounts normalized to the same
+canonical domain and username with different NT hashes cause an error rather
+than silently merging. The CLI reports counts of normalized account records.
+
+### Effective administrative exposure
+
+With `--privilege-exposure`, CredWeave now evaluates both direct user `AdminTo`
+relationships and `AdminTo` inherited through explicit nested `MemberOf` group
+edges in BloodHound graph JSON exports. `Effective` is the union of targets,
+so a system accessible through multiple routes counts once. The privilege CSV
+includes direct/inherited/effective target lists and granting group names.
+`--credential-exposure-csv` uses effective administrative reach.
+
+**Data requirement:** BloodHound collector ZIPs alone do not necessarily contain
+these graph relationships. Export nodes and edges with `MemberOf` and `AdminTo`
+for complete results. Missing edges produce an undercount. The results do not
+model every BloodHound edge type or establish verified access.
+
+#### Collector-derived Tier 0 classification evidence
+
+A collector group can contain another group rather than a direct user. CredWeave
+retains that membership chain, so a member of a nested team that is included in
+`Administrators` receives a locally derived Tier 0 label. The path is
+printed by `--privilege-debug USER@DOMAIN` when imported with graph exports.
+Its evidence source identifies the collector archive. This does **not** import
+BloodHound CE's authoritative privilege-zone assignment, which can reflect
+additional configured rules and post-processing.

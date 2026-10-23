@@ -24,12 +24,14 @@ import shutil
 from datetime import datetime
 import sys
 import zipfile
-from collections import defaultdict, Counter
+from collections import defaultdict, Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-VERSION = "1.6.2"
+import credweave_privileges as privilege_exposure
+
+VERSION = "1.6.5"
 
 RED = "\033[31m"
 GREEN = "\033[32m"
@@ -97,10 +99,20 @@ class Account:
     privileges: set[str] = field(default_factory=set)
     sources: set[str] = field(default_factory=set)
     annotations: set[str] = field(default_factory=set)
+    # Collector-derived effective memberships are qualified by the group's domain.
+    # Do not conflate a foreign group with a same-named local group.
+    bh_effective_groups: set[tuple[str, str]] = field(default_factory=set)
+    # One shortest collector membership chain per classification, nearest group first.
+    privilege_evidence: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    privilege_evidence_source: dict[str, str] = field(default_factory=dict)
 
     @property
     def key(self) -> str:
         return account_key(self.username)
+
+    @property
+    def identity_key(self) -> str:
+        return f"{(self.domain or '?').casefold()}\\{self.key}"
 
     @property
     def enabled(self) -> bool | None:
@@ -137,21 +149,28 @@ class Account:
 
 
 class Registry:
+    """Domain-qualified identities; unqualified accounts remain isolated."""
     def __init__(self) -> None:
         self.accounts: dict[str, Account] = {}
         self.sid_index: dict[str, str] = {}
+        # BloodHound group records and reverse MemberOf edges, retained across
+        # multiple collector ZIPs; group identities use SIDs when available.
+        self.bh_groups: dict[str, dict[str, str]] = {}
+        self.bh_memberof: dict[str, set[str]] = defaultdict(set)
 
     def get(self, username: str, domain: str | None = None) -> Account:
-        username = normalize_username(username)
-        key = account_key(username)
+        raw = username.strip().strip('"')
+        if "\\" in raw:
+            prefix, raw = raw.rsplit("\\", 1)
+            domain = domain or prefix
+        elif "@" in raw:
+            raw, suffix = raw.rsplit("@", 1)
+            domain = domain or suffix
+        name = normalize_username(raw)
+        domain = domain.strip().upper() if domain else None
+        key = f"{domain.casefold()}\\{account_key(name)}" if domain else f"?\\{account_key(name)}"
         if key not in self.accounts:
-            self.accounts[key] = Account(
-                username=username,
-                domain=domain,
-                machine=username.endswith("$"),
-            )
-        elif domain and not self.accounts[key].domain:
-            self.accounts[key].domain = domain
+            self.accounts[key] = Account(username=name, domain=domain, machine=name.endswith("$"))
         return self.accounts[key]
 
     def by_sid(self, sid: str) -> Account | None:
@@ -161,7 +180,45 @@ class Registry:
     def bind_sid(self, account: Account, sid: str | None) -> None:
         if sid:
             account.sid = sid
-            self.sid_index[sid.casefold()] = account.key
+            self.sid_index[sid.casefold()] = next(
+                (key for key, value in self.accounts.items() if value is account), ""
+            )
+
+    def resolve(self, name: str, domain: str | None = None) -> Account | None:
+        """Resolve only uniquely, never guess between same-name domain accounts."""
+        normalized = account_key(name)
+        candidates = [a for a in self.accounts.values() if a.key == normalized
+                      and (not domain or (a.domain and a.domain.casefold() == domain.casefold()))]
+        return candidates[0] if len(candidates) == 1 else None
+
+
+def reconcile_unqualified_accounts(registry: Registry) -> list[str]:
+    """Enrich legacy single-dump accounts only when a unique BH identity exists."""
+    warnings = []
+    for key, account in list(registry.accounts.items()):
+        if account.domain is not None or not account.nt_hash:
+            continue
+        candidates = [a for a in registry.accounts.values()
+                      if a is not account and a.key == account.key and a.domain]
+        if len(candidates) != 1:
+            if len(candidates) > 1:
+                warnings.append(f"Ambiguous identity {account.username}: " +
+                                ", ".join(sorted(a.domain for a in candidates)))
+            continue
+        target = candidates[0]
+        if target.nt_hash and target.nt_hash != account.nt_hash:
+            warnings.append(f"Conflicting credential for {account.username}@{target.domain}; not merged")
+            continue
+        target.nt_hash = account.nt_hash
+        target.lm_hash = account.lm_hash
+        target.rid = account.rid
+        target.machine = account.machine
+        target.sources.update(account.sources)
+        target.annotations.update(account.annotations)
+        for observation in account.status_observations:
+            target.observe_status(observation.value, observation.source)
+        del registry.accounts[key]
+    return warnings
 
 
 def normalize_username(value: str) -> str:
@@ -291,7 +348,41 @@ def wrap_accounts(accounts: Iterable[Account], width: int, compact: bool = False
     return chunks
 
 
-def parse_dump(path: str, registry: Registry, strict: bool = False) -> tuple[list[Account], list[Account], int]:
+def parse_domain_aliases(specs: list[str]) -> dict[str, str]:
+    """Parse explicit ALIAS=CANONICAL mappings; reject ambiguous or cyclic mappings."""
+    aliases: dict[str, str] = {}
+    for spec in specs:
+        if "=" not in spec:
+            raise ValueError("--domain-alias requires ALIAS=CANONICAL")
+        source, target = (part.strip().upper() for part in spec.split("=", 1))
+        if not source or not target or "\\" in source + target or "@" in source + target:
+            raise ValueError(f"invalid --domain-alias mapping: {spec}")
+        if source in aliases and aliases[source] != target:
+            raise ValueError(f"conflicting --domain-alias mappings for {source}")
+        if source == target:
+            raise ValueError(f"self-referential --domain-alias mapping: {spec}")
+        aliases[source] = target
+    for source in aliases:
+        seen = set()
+        current = source
+        while current in aliases:
+            if current in seen:
+                raise ValueError(f"cyclic --domain-alias mapping involving {source}")
+            seen.add(current)
+            current = aliases[current]
+    return aliases
+
+
+def canonical_domain(domain: str, aliases: dict[str, str]) -> str:
+    current = domain.strip().upper()
+    while current in aliases:
+        current = aliases[current]
+    return current
+
+
+def parse_dump(path: str, registry: Registry, strict: bool = False, domain_hint: str | None = None,
+               domain_aliases: dict[str, str] | None = None,
+               alias_counts: dict[tuple[str, str], int] | None = None) -> tuple[list[Account], list[Account], int]:
     users, machines, skipped = [], [], 0
     source = f"dump:{Path(path).name}"
 
@@ -319,8 +410,22 @@ def parse_dump(path: str, registry: Registry, strict: bool = False) -> tuple[lis
                 skipped += 1
                 continue
 
-            domain = raw_user.rsplit("\\", 1)[0] if "\\" in raw_user else None
+            embedded_domain = raw_user.rsplit("\\", 1)[0] if "\\" in raw_user else None
+            if "@" in raw_user and not embedded_domain:
+                embedded_domain = raw_user.rsplit("@", 1)[1]
+            aliases = domain_aliases or {}
+            domain = canonical_domain(embedded_domain or domain_hint, aliases) if (embedded_domain or domain_hint) else None
+            expected = canonical_domain(domain_hint, aliases) if domain_hint else None
+            if expected and domain and domain != expected:
+                raise ValueError(f"{path}:{lineno}: embedded domain {embedded_domain} conflicts with label {domain_hint}")
+            if embedded_domain and alias_counts is not None:
+                original = embedded_domain.upper()
+                if original != domain:
+                    alias_counts[(original, domain)] = alias_counts.get((original, domain), 0) + 1
+            # Explicit canonical domain overrides the raw username prefix.
             a = registry.get(raw_user, domain)
+            if a.nt_hash and a.nt_hash != nt:
+                raise ValueError(f"{path}:{lineno}: conflicting NT hashes for {a.username}@{a.domain or 'UNKNOWN'}")
             a.rid, a.lm_hash, a.nt_hash = rid, lm, nt
             a.machine = a.username.endswith("$")
             a.sources.add(source)
@@ -334,8 +439,8 @@ def parse_dump(path: str, registry: Registry, strict: bool = False) -> tuple[lis
             (machines if a.machine else users).append(a)
 
     # dedupe if source contained duplicate account rows
-    users = list({a.key: a for a in users}.values())
-    machines = list({a.key: a for a in machines}.values())
+    users = list({id(a): a for a in users}.values())
+    machines = list({id(a): a for a in machines}.values())
     return users, machines, skipped
 
 
@@ -346,7 +451,9 @@ def load_admins_file(path: str, registry: Registry) -> None:
             name = line.strip()
             if not name or name.startswith("#"):
                 continue
-            a = registry.get(name)
+            a = registry.resolve(name)
+            if a is None:
+                a = registry.get(name)
             a.privileges.add("Explicit Privileged")
             a.sources.add(source)
 
@@ -435,87 +542,144 @@ def bloodhound_enabled(props: dict[str, Any]) -> bool | None:
     return None
 
 
+def _bh_sid_key(value: str) -> str:
+    return f"sid:{str(value).strip().casefold()}"
+
+
+def _bh_group_key(sid: str | None, name: str, domain: str) -> str:
+    if sid:
+        return _bh_sid_key(sid)
+    return f"group:{domain.casefold()}\\{name.casefold()}"
+
+
+def _bh_membership_path(registry: Registry, account: Account) -> dict[str, tuple[str, ...]]:
+    """Find shortest paths from a user to effective groups (cycle safe)."""
+    if not account.sid:
+        return {}
+    first = _bh_sid_key(account.sid)
+    paths: dict[str, tuple[str, ...]] = {}
+    queue = deque((key, (key,)) for key in sorted(registry.bh_memberof.get(first, ())))
+    while queue:
+        group_key, path = queue.popleft()
+        if group_key in paths or group_key not in registry.bh_groups:
+            continue
+        paths[group_key] = path
+        for parent in sorted(registry.bh_memberof.get(group_key, ())):
+            if parent not in paths and parent not in path:
+                queue.append((parent, path + (parent,)))
+    return paths
+
+
+def _apply_bh_effective_memberships(registry: Registry) -> None:
+    """Update all users after each ZIP, allowing membership edges across archives.
+
+    The collector includes group members by SID, including nested groups.
+    This is locally derived Tier 0 evidence, not a BloodHound CE zone tag.
+    """
+    for account in registry.accounts.values():
+        for key, path in _bh_membership_path(registry, account).items():
+            group = registry.bh_groups[key]
+            name, domain = group['name'], group['domain']
+            account.groups.add(name)
+            account.bh_effective_groups.add((domain, name))
+            classification = []
+            label = PRIVILEGED_GROUPS.get(name.casefold())
+            if label:
+                classification.append(label)
+            if name.casefold() in TIER0_GROUPS:
+                classification.append('Tier 0')
+            for privilege in classification:
+                account.privileges.add(privilege)
+                names = tuple(f"{registry.bh_groups[gid]['name']}@{registry.bh_groups[gid]['domain']}" for gid in path)
+                previous = account.privilege_evidence.get(privilege)
+                if previous is None or (len(names), names) < (len(previous), previous):
+                    account.privilege_evidence[privilege] = names
+                    account.privilege_evidence_source[privilege] = group['source']
+                account.sources.add(group['source'])
+
+
 def import_bloodhound(path: str, registry: Registry) -> dict[str, Any]:
     counts = {
-        "users": 0,
-        "groups": 0,
-        "memberships": 0,
-        "status": 0,
-        "status_properties": 0,
-        "schema_versions": set(),
+        'users': 0, 'groups': 0, 'memberships': 0,
+        'nested_memberships': 0, 'status': 0, 'status_properties': 0,
+        'schema_versions': set(),
     }
-    group_members: list[tuple[str, str, str]] = []  # group, member id/name, source
-
+    pending_groups: list[tuple[str, str, str, list[dict[str, Any]]]] = []
     for source_name, obj in json_objects_from_bloodhound(path):
         typ = bh_type(obj, source_name)
         records = bh_records(obj)
         source = f"bloodhound:{Path(path).name}"
-
         if isinstance(obj, dict):
-            meta = obj.get("meta") or {}
-            if isinstance(meta, dict) and meta.get("version") is not None:
-                counts["schema_versions"].add(str(meta.get("version")))
-
-        if typ == "users":
+            meta = obj.get('meta') or {}
+            if isinstance(meta, dict) and meta.get('version') is not None:
+                counts['schema_versions'].add(str(meta['version']))
+        if typ == 'users':
             for rec in records:
-                props = rec.get("Properties") or rec.get("properties") or {}
-                name = clean_bh_name(props.get("samaccountname") or props.get("name") or rec.get("Name"))
+                props = rec.get('Properties') or rec.get('properties') or {}
+                name = clean_bh_name(props.get('samaccountname') or props.get('name') or rec.get('Name'))
                 if not name:
                     continue
-                domain = props.get("domain")
-                a = registry.get(name, str(domain) if domain else None)
-                sid = rec.get("ObjectIdentifier") or rec.get("objectid") or props.get("objectid")
-                registry.bind_sid(a, str(sid) if sid else None)
-                status_keys = {
-                    "enabled", "Enabled",
-                    "useraccountcontrol", "userAccountControl", "UserAccountControl",
-                }
+                domain = props.get('domain')
+                account = registry.get(name, str(domain) if domain else None)
+                sid = rec.get('ObjectIdentifier') or rec.get('objectid') or props.get('objectid')
+                registry.bind_sid(account, str(sid) if sid else None)
+                status_keys = {'enabled', 'Enabled', 'useraccountcontrol',
+                               'userAccountControl', 'UserAccountControl'}
                 if any(key in props for key in status_keys):
-                    counts["status_properties"] += 1
-
+                    counts['status_properties'] += 1
                 enabled = bloodhound_enabled(props)
                 if enabled is not None:
-                    a.observe_status(enabled, source)
-                    counts["status"] += 1
-                a.sources.add(source)
-                counts["users"] += 1
-
-        elif typ == "groups":
+                    account.observe_status(enabled, source)
+                    counts['status'] += 1
+                account.sources.add(source)
+                counts['users'] += 1
+        elif typ == 'groups':
             for rec in records:
-                props = rec.get("Properties") or rec.get("properties") or {}
-                gname = str(props.get("name") or props.get("samaccountname") or rec.get("Name") or "")
-                gshort = clean_bh_name(gname)
-                if not gshort:
+                props = rec.get('Properties') or rec.get('properties') or {}
+                raw = str(props.get('name') or props.get('samaccountname') or rec.get('Name') or '')
+                name = clean_bh_name(raw)
+                domain = str(props.get('domain') or (raw.rsplit('@', 1)[-1] if '@' in raw else '')).upper()
+                if not name:
                     continue
-                counts["groups"] += 1
-                members = rec.get("Members") or rec.get("members") or []
+                sid = rec.get('ObjectIdentifier') or rec.get('objectid') or props.get('objectid')
+                key = _bh_group_key(str(sid) if sid else None, name, domain)
+                registry.bh_groups[key] = {'name': name, 'domain': domain, 'source': source}
+                counts['groups'] += 1
+                members = rec.get('Members') or rec.get('members') or []
                 if isinstance(members, list):
-                    for member in members:
-                        if not isinstance(member, dict):
-                            continue
-                        mid = member.get("ObjectIdentifier") or member.get("objectid") or member.get("ObjectId")
-                        mname = member.get("Name") or member.get("name")
-                        if mid or mname:
-                            group_members.append((gshort, str(mid or mname), source))
+                    pending_groups.append((key, name, domain, members))
 
-    # Resolve after all user JSON has been seen.
-    for group, ident, source in group_members:
-        a = registry.by_sid(ident)
-        if not a:
-            # Some exports/variants may provide a name rather than SID.
-            candidate = clean_bh_name(ident)
-            a = registry.accounts.get(account_key(candidate))
-        if not a:
-            continue
-        a.groups.add(group)
-        label = PRIVILEGED_GROUPS.get(group.casefold())
-        if label:
-            a.privileges.add(label)
-        if group.casefold() in TIER0_GROUPS:
-            a.privileges.add("Tier 0")
-        a.sources.add(source)
-        counts["memberships"] += 1
+    # All groups and users are now registered. Edges are identity-scoped by SID.
+    # Refuse short-name-only cross-domain matches; ambiguous names are unsafe.
+    for parent, _, group_domain, members in pending_groups:
+        for member in members:
+            if not isinstance(member, dict):
+                continue
+            mid = member.get('ObjectIdentifier') or member.get('objectid') or member.get('ObjectId')
+            name = str(member.get('Name') or member.get('name') or '')
+            kind = str(member.get('ObjectType') or member.get('objecttype') or '').casefold()
+            if mid:
+                member_key = _bh_sid_key(str(mid))
+            elif name and '@' in name:
+                member_name, member_domain = name.rsplit('@', 1)
+                if kind == 'group':
+                    member_key = _bh_group_key(None, clean_bh_name(member_name), member_domain.upper())
+                else:
+                    user = registry.resolve(clean_bh_name(member_name), member_domain.upper())
+                    member_key = _bh_sid_key(user.sid) if user is not None and user.sid else ''
+            else:
+                # If the collector provides neither SID nor fully qualified name,
+                # never guess an identity from a potentially ambiguous short name.
+                continue
+            if not member_key:
+                continue
+            registry.bh_memberof[member_key].add(parent)
+            if member_key in registry.bh_groups or kind == 'group':
+                counts['nested_memberships'] += 1
+            elif mid and registry.by_sid(str(mid)):
+                counts['memberships'] += 1
 
+    _apply_bh_effective_memberships(registry)
     return counts
 
 
@@ -598,7 +762,7 @@ def import_enum4linux(path: str, registry: Registry) -> dict[str, int]:
                 continue
             for member in collect_strings(value):
                 candidate = clean_bh_name(member)
-                a = registry.accounts.get(account_key(candidate))
+                a = registry.resolve(candidate)
                 if not a:
                     continue
                 a.groups.add(gshort)
@@ -707,9 +871,9 @@ def cracked_password_intelligence(result: dict[str, Any], plains: dict[str, str]
             if username_similarity(plain, a.username):
                 username_derived.append((a, plain))
 
-    cracked_keys = {a.key for a in cracked_accounts}
+    cracked_keys = {a.identity_key for a in cracked_accounts}
     def rate(accounts):
-        return (sum(a.key in cracked_keys for a in accounts), len(accounts))
+        return (sum(a.identity_key in cracked_keys for a in accounts), len(accounts))
 
     enabled = [a for a in result["users"] if a.enabled is True]
     privileged = [a for a in result["users"] if a.privileged]
@@ -1366,7 +1530,7 @@ def hash_map(accounts: Iterable[Account]) -> dict[str, list[Account]]:
         if a.nt_hash:
             out[a.nt_hash].append(a)
     for vals in out.values():
-        vals.sort(key=lambda a: a.username.casefold())
+        vals.sort(key=lambda a: (a.username.casefold(), (a.domain or "").casefold()))
     return dict(out)
 
 
@@ -1620,6 +1784,7 @@ def print_report(
     show_hashes: bool,
     enabled_only: bool,
     expand: bool,
+    privilege_exposure_enabled: bool = False,
 ) -> None:
     users = result["users"]
     hm = result["hash_map"]
@@ -1651,10 +1816,11 @@ def print_report(
         f"{CYAN}[i]{RESET} Reuse groups: {len(actionable_reuse)} actionable "
         f"(enabled/unknown present), {len(disabled_only_reuse)} disabled-only"
     )
-    print(
-        f"{DIM}Legend: [T0] Tier 0  [P] Privileged  [A] Admin-like name  "
-        f"[D] Disabled  [!] Conflicting status{RESET}"
-    )
+    if not privilege_exposure_enabled:
+        print(
+            f"{DIM}Legend: [T0] Tier 0  [P] Privileged  [A] Admin-like name  "
+            f"[D] Disabled  [!] Conflicting status{RESET}"
+        )
 
     fixed = HASH_COL_WIDTH + COUNT_COL_WIDTH + 2 * SEPARATOR_WIDTH
     users_width = max(term_width - fixed, MIN_USER_COL_WIDTH)
@@ -1881,7 +2047,7 @@ def affected_resource_rows(result: dict[str, Any], finding: str) -> list[dict[st
                     None,
                     group_name,
                     "Credential shared with: " + ", ".join(
-                        other.username for other in accounts if other.key != account.key
+                        other.username for other in accounts if other.identity_key != account.identity_key
                     ),
                 )
 
@@ -2086,14 +2252,16 @@ def parse_args() -> argparse.Namespace:
         prog="credweave",
         description="Credential Relationship Analysis for Active Directory",
     )
-    p.add_argument("dump", help="user:rid:lmhash:nthash credential dump")
+    p.add_argument("dump", nargs="?", help="user:rid:lmhash:nthash credential dump (optional for standalone graph analysis)")
     enrich = p.add_argument_group("enrichment")
+    enrich.add_argument("--ntds", action="append", default=[], metavar="DOMAIN=PATH", help="domain-labeled NTDS dump; repeatable")
+    enrich.add_argument("--domain-alias", action="append", default=[], metavar="ALIAS=CANONICAL", help="explicit domain-name equivalence for NTDS inputs; repeatable")
     enrich.add_argument("--bloodhound", action="append", default=[], metavar="PATH", help="BloodHound collector ZIP, directory, or JSON; repeatable")
     enrich.add_argument("--enum4linux", action="append", default=[], metavar="JSON", help="enum4linux-ng JSON; repeatable")
     enrich.add_argument("-a", "--admins-file", action="append", default=[], metavar="FILE", help="explicit privileged accounts; repeatable")
 
     intel = p.add_argument_group("credential intelligence")
-    intel.add_argument("--potfile", metavar="FILE", help="hashcat potfile")
+    intel.add_argument("--potfile", action="append", default=[], metavar="FILE", help="hashcat potfile; repeatable")
     intel.add_argument("--crack-out", metavar="FILE", help="write unique uncracked NT hashes")
     intel.add_argument("--lm-crack-out", metavar="FILE", help="write unique LM hashes")
     intel.add_argument("-l", "--lm", action="store_true", help="report accounts storing LM hashes")
@@ -2111,12 +2279,18 @@ def parse_args() -> argparse.Namespace:
     intel.add_argument("--crack-out-t0", metavar="FILE", help="write unique uncracked Tier 0 NT hashes")
 
     analysis = p.add_argument_group("analysis")
+    analysis.add_argument("--privilege-exposure", action="store_true", help="analyze direct and inherited BloodHound graph AdminTo relationships")
+    analysis.add_argument("--privilege-debug", metavar="ACCOUNT@DOMAIN", help="explain graph-observed administrative paths for an account (or SID)")
+    analysis.add_argument("--privilege-debug-limit", type=int, default=30, metavar="N", help="maximum targets shown in privilege debug (default: 30)")
+    analysis.add_argument("--min-admin-count", type=int, default=10, metavar="N", help="broad administrative reach threshold (default: 10)")
     analysis.add_argument("--diff", metavar="OLDDUMP", help="compare with older credential dump")
     analysis.add_argument("--enabled-only", action="store_true", help="hide disabled accounts from general reuse table only; relationship analysis still considers them")
     analysis.add_argument("--strict", action="store_true", help="abort on malformed dump records")
     analysis.add_argument("--expand", action="store_true", help="fully enumerate large reuse groups instead of summarizing them")
 
     output = p.add_argument_group("output")
+    output.add_argument("--privilege-csv", metavar="FILE", help="write administrative exposure candidates CSV")
+    output.add_argument("--credential-exposure-csv", metavar="FILE", help="write credential reuse administrative exposure CSV")
     output.add_argument("-o", "--output", metavar="CSV", help="write reuse CSV")
     output.add_argument("--json", metavar="FILE", help="write full JSON analysis")
     output.add_argument("--affected-resources", metavar="FILE", help="write report-ready affected-resource table")
@@ -2144,12 +2318,42 @@ def main() -> int:
     registry = Registry()
 
     try:
-        users, machines, skipped = parse_dump(args.dump, registry, args.strict)
+        if not args.dump and not args.ntds and not args.privilege_exposure:
+            raise ValueError("credential dump is required unless --privilege-exposure is specified")
+        if args.privilege_debug_limit < 1:
+            raise ValueError("--privilege-debug-limit must be at least 1")
+        if args.privilege_debug and not args.privilege_exposure:
+            raise ValueError("--privilege-debug requires --privilege-exposure")
+        if args.min_admin_count < 1:
+            raise ValueError("--min-admin-count must be at least 1")
+        if args.privilege_exposure and not args.bloodhound:
+            raise ValueError("--privilege-exposure requires --bloodhound")
+        aliases = parse_domain_aliases(args.domain_alias)
+        alias_counts: dict[tuple[str, str], int] = {}
+        users, machines, skipped = parse_dump(args.dump, registry, args.strict, domain_aliases=aliases,
+                                              alias_counts=alias_counts) if args.dump else ([], [], 0)
+        for spec in args.ntds:
+            if "=" not in spec:
+                raise ValueError("--ntds requires DOMAIN=PATH")
+            domain, path = spec.split("=", 1)
+            if not domain.strip() or not path.strip():
+                raise ValueError("--ntds requires nonempty DOMAIN and PATH")
+            u, m, n = parse_dump(path, registry, args.strict, domain_hint=domain.strip(),
+                                 domain_aliases=aliases, alias_counts=alias_counts)
+            users.extend(u); machines.extend(m); skipped += n
+        for (original, canonical), count in sorted(alias_counts.items()):
+            print(f"{CYAN}[i]{RESET} Domain alias: {original} -> {canonical} ({count} account record(s) normalized)")
+        graphs = []
 
         for path in args.admins_file:
             load_admins_file(path, registry)
 
         for path in args.bloodhound:
+            if args.privilege_exposure:
+                for _, obj in json_objects_from_bloodhound(path):
+                    graph = privilege_exposure.parse_graph(obj)
+                    if graph is not None:
+                        graphs.append(graph)
             counts = import_bloodhound(path, registry)
             versions = ",".join(sorted(counts["schema_versions"])) or "unknown"
             print(
@@ -2178,9 +2382,62 @@ def main() -> int:
             counts = import_enum4linux(path, registry)
             print(f"{CYAN}[i]{RESET} enum4linux-ng {Path(path).name}: {counts['users']} user record(s), {counts['memberships']} privileged membership(s) resolved")
 
-        plains = load_potfile(args.potfile) if args.potfile else {}
+        for warning in reconcile_unqualified_accounts(registry):
+            print(f"{YELLOW}[!] {warning}; credential enrichment skipped{RESET}", file=sys.stderr)
+
+        plains = {}
+        for potpath in args.potfile:
+            for h, plaintext in load_potfile(potpath).items():
+                if h in plains and plains[h] != plaintext:
+                    raise ValueError(f"conflicting recovered plaintext for NT hash {mask_hash(h)} across potfiles")
+                plains[h] = plaintext
         result = analyze(registry)
         password_intel = cracked_password_intelligence(result, plains) if plains else None
+        exposure_rows, credential_exposure_rows = [], []
+        if args.privilege_exposure:
+            if not graphs:
+                raise ValueError("no supported BloodHound nodes/edges graph export found; collector ZIPs alone do not provide direct AdminTo edges")
+            diagnostics = privilege_exposure.graph_diagnostics(graphs)
+            print(f"{CYAN}[i]{RESET} Graph relationships: "
+                  f"{diagnostics['direct_edges']} user AdminTo, "
+                  f"{diagnostics['group_admin_edges']} group AdminTo, "
+                  f"{diagnostics['user_memberships']} user MemberOf, "
+                  f"{diagnostics['nested_memberships']} group MemberOf (raw input counts)")
+            merged_graph = privilege_exposure.merge_graphs(graphs, registry)
+            exposure_rows, credential_exposure_rows = privilege_exposure.analyze_exposure(
+                merged_graph, registry, result["reused"], args.min_admin_count
+            )
+            if args.privilege_debug:
+                privilege_exposure.print_privilege_debug(merged_graph, args.privilege_debug, args.privilege_debug_limit, registry=registry)
+                # Show reproducible collector evidence separately from graph
+                # administrative reach. Neither implies a confirmed CE zone tag.
+                debug_account = registry.by_sid(args.privilege_debug)
+                if debug_account is None and '@' in args.privilege_debug:
+                    debug_name, debug_domain = args.privilege_debug.rsplit('@', 1)
+                    debug_account = registry.resolve(debug_name, debug_domain)
+                if debug_account is not None:
+                    tier0_color = RED if debug_account.tier0 else DIM
+                    print(f'  {DIM}Locally derived Tier 0:{RESET} '
+                          f'{tier0_color}{"Yes" if debug_account.tier0 else "No"}{RESET}')
+                    chain = debug_account.privilege_evidence.get('Tier 0')
+                    if chain:
+                        identity = privilege_exposure.format_debug_identity(
+                            debug_account.username, debug_account.domain)
+                        groups = [privilege_exposure.format_debug_identity(group) for group in chain]
+                        print(f'  {DIM}Collector MemberOf evidence:{RESET} '
+                              + f'{CYAN}{identity}{RESET} -> '
+                              + f' {DIM}->{RESET} '.join(f'{YELLOW}{group}{RESET}' for group in groups))
+                        print(f'  {DIM}Evidence source:{RESET} '
+                              + debug_account.privilege_evidence_source['Tier 0'])
+                    print(f'  {DIM}BloodHound CE zone assignment: Not imported{RESET}')
+            print(f"{DIM}Legend: [T0] Tier 0  [P] Privileged  [A] Admin-like name  [D] Disabled  [!] Conflicting status{RESET}")
+            privilege_exposure.print_exposure(exposure_rows, credential_exposure_rows, args.min_admin_count, registry=registry)
+        if args.privilege_csv:
+            privilege_exposure.write_csv(args.privilege_csv, exposure_rows,
+                ['Account','Domain','AdminTo Systems','Direct AdminTo','Inherited AdminTo','Effective AdminTo','Direct Targets','Inherited Targets','Effective Targets','Granting Groups','Target Domains','Tier Zero Targets','Tier Zero Systems','Flags','SID','Credential Match','Match Method','Review Status'])
+        if args.credential_exposure_csv:
+            privilege_exposure.write_csv(args.credential_exposure_csv, [{**row, "Hash": shown_hash(row["Hash"], args.show_hashes)} for row in credential_exposure_rows],
+                ['Hash','Accounts Sharing','Account Domains','Cross-Domain Reuse','Accounts by Domain','Account Details','Admin Accounts','Administrative Account Count','Privileged Account Count','Tier Zero Account Count','AdminTo Relationships','Unique Admin Targets','Target Domains','Tier Zero Targets'])
 
         if args.show_plaintext and not args.potfile:
             print(f"{RED}Error: --show-plaintext requires --potfile.{RESET}")
@@ -2209,7 +2466,7 @@ def main() -> int:
                     result,
                     plains,
                     args.attack_dir,
-                    args.potfile,
+                    args.potfile[0],
                     args.hashcat_bin,
                     args.combinator_bin,
                 )
@@ -2294,13 +2551,15 @@ def main() -> int:
                     {"hash": shown_hash(h, args.show_hashes), "enabled": [a.username for a in e], "disabled": [a.username for a in d]}
                     for h, e, d in result["enabled_disabled"]
                 ],
+                "privilege_exposure": exposure_rows if args.privilege_exposure else None,
+                "credential_exposure": [{**row, "Hash": shown_hash(row["Hash"], args.show_hashes)} for row in credential_exposure_rows] if args.privilege_exposure else None,
                 "diff": diff,
             }
             Path(args.json).write_text(json.dumps(payload, indent=2), encoding="utf-8")
             print(f"{CYAN}[i]{RESET} JSON written to {args.json}")
 
         term_width = args.width if args.width and args.width > 0 else get_terminal_width()
-        print_report(result, term_width, args.show_hashes, args.enabled_only, args.expand)
+        print_report(result, term_width, args.show_hashes, args.enabled_only, args.expand, args.privilege_exposure)
 
         if args.cracked_t0:
             print_tier0_recovery(result, plains, True, args.show_plaintext, term_width)

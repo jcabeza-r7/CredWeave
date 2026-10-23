@@ -13,7 +13,7 @@ spec.loader.exec_module(cw)
 
 class CredWeaveSmokeTests(unittest.TestCase):
     def test_version(self):
-        self.assertEqual(cw.VERSION, "1.6.2")
+        self.assertEqual(cw.VERSION, "1.6.5")
 
     def test_help(self):
         p = subprocess.run([sys.executable, str(SCRIPT), "--help"],
@@ -38,7 +38,7 @@ class CredWeaveSmokeTests(unittest.TestCase):
         self.assertTrue(all(w == w.lower() for w in words))
 
     def test_hashcat_hex_plaintexts(self):
-        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[436f6c6f73656e73657340323a3134]"), "Colosenses@2:14")
+        self.assertEqual(cw.decode_hashcat_plaintext("$HEX[64656d6f3a74776f]"), "demo:two")
         self.assertEqual(cw.decode_hashcat_plaintext("$HEX[706173733a776f7264]"), "pass:word")
         self.assertEqual(cw.decode_hashcat_plaintext("$HEX[70617373]"), "pass")
         self.assertEqual(cw.decode_hashcat_plaintext("$HEX[zz]"), "$HEX[zz]")
